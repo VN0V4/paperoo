@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""paperoo - browse and download wallpapers from your terminal.
+
+Run it with no arguments to open the browser and type a search:
+    paperoo
+
+Or start the browser with a search already filled in:
+    paperoo --4k 'satoru gojo sunset'
+    paperoo --phone cyberpunk city
+
+Skip the browser and download straight away (good for scripts):
+    paperoo --4k -y -n 10 'satoru gojo'
+    paperoo --4k --list 'studio ghibli'        # just print the links
+"""
+
+import argparse
+import base64
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+__version__ = "0.2.0"
+
+API_URL = "https://wallhaven.cc/api/v1/search"
+USER_AGENT = f"paperoo/{__version__}"
+
+# flag -> minimum resolution
+RESOLUTIONS = {
+    "hd": "1280x720",
+    "1080p": "1920x1080",
+    "1440p": "2560x1440",
+    "2k": "2560x1440",
+    "4k": "3840x2160",
+    "5k": "5120x2880",
+    "8k": "7680x4320",
+}
+
+SORTS = ["relevance", "random", "toplist", "views", "favorites", "date_added"]
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else str(text)
+
+
+def die(msg):
+    print(c("error:", "1;31"), msg, file=sys.stderr)
+    sys.exit(1)
+
+
+class SearchError(Exception):
+    pass
+
+
+def pictures_dir():
+    pictures = os.environ.get("XDG_PICTURES_DIR")
+    if not pictures:
+        # Respect ~/.config/user-dirs.dirs if present
+        dirs_file = Path.home() / ".config" / "user-dirs.dirs"
+        if dirs_file.exists():
+            for line in dirs_file.read_text().splitlines():
+                if line.startswith("XDG_PICTURES_DIR="):
+                    pictures = line.split("=", 1)[1].strip('"').replace("$HOME", str(Path.home()))
+    return Path(pictures or Path.home() / "Pictures")
+
+
+def is_caelestia():
+    """True when running under the Caelestia shell (https://github.com/caelestia-dots)."""
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "caelestia"
+    return bool(shutil.which("caelestia")) and state.is_dir()
+
+
+def caelestia_wallpaper_dir():
+    """The folder Caelestia's wallpaper picker scans (recursively)."""
+    if os.environ.get("CAELESTIA_WALLPAPERS_DIR"):
+        return Path(os.environ["CAELESTIA_WALLPAPERS_DIR"]).expanduser()
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "caelestia" / "shell.json"
+    try:
+        configured = json.loads(config.read_text()).get("paths", {}).get("wallpaperDir")
+        if configured:
+            return Path(configured).expanduser()
+    except (OSError, ValueError, AttributeError):
+        pass
+    return pictures_dir() / "Wallpapers"
+
+
+def default_output_dir():
+    # On Caelestia, save inside its wallpaper folder so downloads show up in its picker
+    if is_caelestia():
+        return caelestia_wallpaper_dir() / "paperoo"
+    return pictures_dir() / "paperoo"
+
+
+def slugify(text):
+    keep = "".join(ch if ch.isalnum() else "-" for ch in text.lower())
+    return "-".join(filter(None, keep.split("-"))) or "wallpapers"
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def http_get(url, retries=3):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries - 1:  # rate limited
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < retries - 1:
+                time.sleep(1)
+                continue
+            raise
+
+
+# --------------------------------------------------------------------------- search
+
+
+class Search:
+    """A wallhaven search whose results are fetched lazily, page by page."""
+
+    def __init__(self, query, res=None, exact=False, ratio=None, sort="relevance", categories="111"):
+        self.query = query
+        self.res, self.exact, self.ratio = res, exact, ratio
+        self.sort, self.categories = sort, categories
+        self.results, self.total = [], 0
+        self._page, self._last_page, self._seed = 0, None, None
+
+    @property
+    def exhausted(self):
+        return self._last_page is not None and self._page >= self._last_page
+
+    def describe(self):
+        bits = [f"{self.res}{'' if self.exact else '+'}" if self.res else "any res"]
+        if self.ratio:
+            bits.append(self.ratio)
+        if self.sort != "relevance":
+            bits.append(self.sort)
+        return ", ".join(bits)
+
+    def _fetch_page(self):
+        params = {
+            "q": self.query,
+            "sorting": self.sort,
+            "order": "desc",
+            "categories": self.categories,
+            "purity": "100",  # SFW only
+            "page": self._page + 1,
+        }
+        if self.res:
+            params["resolutions" if self.exact else "atleast"] = self.res
+        if self.ratio:
+            params["ratios"] = self.ratio
+        if self.sort == "toplist":
+            params["topRange"] = "1y"
+        if self._seed:
+            params["seed"] = self._seed  # keeps random sort stable across pages
+        if os.environ.get("WALLHAVEN_API_KEY"):
+            params["apikey"] = os.environ["WALLHAVEN_API_KEY"]
+        try:
+            data = json.loads(http_get(f"{API_URL}?{urllib.parse.urlencode(params)}"))
+        except urllib.error.HTTPError as e:
+            raise SearchError(f"wallhaven returned HTTP {e.code}") from e
+        except urllib.error.URLError as e:
+            raise SearchError(f"couldn't reach wallhaven.cc ({e.reason})") from e
+        meta = data.get("meta", {})
+        self._page += 1
+        self._last_page = meta.get("last_page", self._page)
+        self._seed = meta.get("seed")
+        self.total = meta.get("total", 0)
+        self.results.extend(data.get("data", []))
+
+    def ensure(self, n):
+        """Make sure at least `n` results are loaded (if that many exist)."""
+        while len(self.results) < n and not self.exhausted:
+            self._fetch_page()
+        return self.results[:n]
+
+    def run(self):
+        """First fetch. If nothing matches, progressively drop trailing words.
+        Returns a note for the user if the query was changed, else None."""
+        original = self.query
+        words = original.split()
+        while words:
+            self.query = " ".join(words)
+            self.results, self._page, self._last_page, self._seed = [], 0, None, None
+            self._fetch_page()
+            if self.results:
+                return None if self.query == original else \
+                    f"no exact matches for '{original}', showing '{self.query}'"
+            words.pop()
+        self.query = original
+        return None
+
+
+# --------------------------------------------------------------------------- downloads
+
+
+def download(item, dest_dir, cache_dir=None):
+    """Download one wallpaper. Returns (dest, status)."""
+    url = item["path"]
+    name = url.rsplit("/", 1)[-1]
+    dest = dest_dir / name
+    if dest.exists():
+        return dest, "exists"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / name if cache_dir else None
+    if cached and cached.exists():  # already fetched for the big preview
+        shutil.copyfile(cached, dest)
+        return dest, "ok"
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        tmp.write_bytes(http_get(url))
+        tmp.rename(dest)
+    except Exception as e:  # noqa: BLE001 - report and keep going
+        tmp.unlink(missing_ok=True)
+        return dest, f"failed: {e}"
+    return dest, "ok"
+
+
+def set_wallpaper(path):
+    """Try common wallpaper setters; return the name of the one that worked."""
+    path = str(path)
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    candidates = []
+    if is_caelestia():  # also regenerates Caelestia's colour scheme from the wallpaper
+        candidates.append(("caelestia", ["caelestia", "wallpaper", "-f", path]))
+    if shutil.which("swww"):
+        candidates.append(("swww", ["swww", "img", path]))
+    if shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        candidates.append(("hyprpaper", ["hyprctl", "hyprpaper", "reload", f",{path}"]))
+    if "gnome" in desktop or "unity" in desktop or "cinnamon" in desktop:
+        uri = Path(path).as_uri()
+        candidates.append(("gsettings", ["sh", "-c",
+            f"gsettings set org.gnome.desktop.background picture-uri '{uri}' && "
+            f"gsettings set org.gnome.desktop.background picture-uri-dark '{uri}'"]))
+    if "kde" in desktop and shutil.which("plasma-apply-wallpaperimage"):
+        candidates.append(("plasma", ["plasma-apply-wallpaperimage", path]))
+    if shutil.which("swaybg") and os.environ.get("WAYLAND_DISPLAY"):
+        candidates.append(("swaybg", None))
+    if shutil.which("feh") and os.environ.get("DISPLAY"):
+        candidates.append(("feh", ["feh", "--bg-fill", path]))
+    if sys.platform == "darwin":
+        candidates.append(("osascript", ["osascript", "-e",
+            f'tell application "System Events" to tell every desktop to set picture to "{path}"']))
+
+    for name, cmd in candidates:
+        if name == "swaybg":
+            subprocess.run(["pkill", "-x", "swaybg"], capture_output=True)
+            subprocess.Popen(["swaybg", "-m", "fill", "-i", path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            return name
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            return name
+    return None
+
+
+# --------------------------------------------------------------------------- terminal images
+
+
+def detect_previewer():
+    """Pick the best way to draw images in this terminal, or None."""
+    term = os.environ.get("TERM", "")
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
+    if os.environ.get("KITTY_WINDOW_ID") or term == "xterm-kitty" or term_program == "ghostty":
+        if shutil.which("kitten"):
+            return "kitten"
+        if shutil.which("kitty"):
+            return "kitty"
+    if term_program in ("iterm.app", "wezterm") or os.environ.get("LC_TERMINAL") == "iTerm2":
+        return "iterm"
+    if shutil.which("chafa"):
+        return "chafa"
+    return None
+
+
+def move(row, col):
+    """Move the cursor to a 0-based screen position."""
+    sys.stdout.write(f"\033[{row + 1};{col + 1}H")
+
+
+def draw_image(previewer, path, row, col, width, height):
+    """Draw the image at `path` fitted into a width x height cell box."""
+    sys.stdout.flush()
+    if previewer in ("kitten", "kitty"):
+        icat = ["kitten", "icat"] if previewer == "kitten" else ["kitty", "+kitten", "icat"]
+        subprocess.run(icat + ["--stdin", "no", "--scale-up",
+                               "--place", f"{width}x{height}@{col}x{row}", str(path)],
+                       stderr=subprocess.DEVNULL)
+    elif previewer == "iterm":
+        data = Path(path).read_bytes()
+        move(row, col)
+        sys.stdout.write(f"\033]1337;File=inline=1;width={width};height={height};"
+                         f"preserveAspectRatio=1;size={len(data)}:"
+                         f"{base64.b64encode(data).decode()}\a")
+    elif previewer == "chafa":
+        out = subprocess.run(["chafa", "-f", "symbols", "--animate", "off", "--polite", "on",
+                              "--size", f"{width}x{height}", str(path)],
+                             capture_output=True, text=True).stdout
+        for i, line in enumerate(out.rstrip("\n").split("\n")[:height]):
+            move(row + i, col)
+            sys.stdout.write(line)
+        sys.stdout.write("\033[0m")
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------- interactive browser
+
+CELL_W, CELL_H = 30, 11  # one grid cell: thumbnail + label + gap
+THUMB_W, THUMB_H = 28, 9
+HEADER_ROWS, FOOTER_ROWS = 2, 4
+
+HELP = ["type to search · 1 3 5-8 download · a download page · v N view big · s N set wallpaper",
+        "n/p next/prev page · o N open in browser · r 4k change resolution · q quit"]
+
+
+class Browser:
+    def __init__(self, args):
+        self.args = args
+        self.previewer = detect_previewer()
+        self.search = None
+        self.offset = 0
+        self.message = ""
+        self.downloaded = {}  # id -> path
+        self._tmp = tempfile.TemporaryDirectory(prefix="paperoo-")
+        self.cache = Path(self._tmp.name)
+        if not self.previewer:
+            self.message = c("tip: install chafa (or use kitty/WezTerm/iTerm2) to see thumbnails", "33")
+
+    # -- layout -------------------------------------------------------------
+
+    def layout(self):
+        size = shutil.get_terminal_size((80, 24))
+        usable_rows = max(size.lines - HEADER_ROWS - FOOTER_ROWS, 1)
+        if not self.previewer:  # plain text list, one result per line
+            return size, 1, usable_rows
+        cols = max(size.columns // CELL_W, 1)
+        rows = max(usable_rows // CELL_H, 1)
+        return size, cols, rows
+
+    def per_page(self):
+        _, cols, rows = self.layout()
+        return cols * rows
+
+    # -- drawing ------------------------------------------------------------
+
+    def clear(self):
+        if self.previewer in ("kitten", "kitty"):
+            sys.stdout.write("\033_Ga=d,d=A\033\\")  # delete all kitty images
+        sys.stdout.write("\033[2J\033[H")
+
+    def thumb_path(self, item):
+        path = self.cache / f"thumb-{item['id']}.jpg"
+        if not path.exists():
+            try:
+                path.write_bytes(http_get(item["thumbs"]["small"]))
+            except Exception:  # noqa: BLE001 - draw an empty cell instead
+                return None
+        return path
+
+    def render(self):
+        size, cols, rows = self.layout()
+        self.clear()
+        title = c(" paperoo ", "1;30;46")
+        if not self.search:
+            sys.stdout.write(f"{title}  {c('search wallpapers by typing below', '2')}")
+            self.draw_footer(size)
+            return
+        s = self.search
+        items = s.ensure(self.offset + cols * rows)[self.offset:]
+        page = self.offset // (cols * rows) + 1
+        pages = max(-(-s.total // (cols * rows)), 1)
+        sys.stdout.write(f"{title}  {c(repr(s.query), '1')}  {c(s.describe(), '36')}  "
+                         f"{c(f'{s.total} results · page {page}/{pages}', '2')}")
+
+        if not items:
+            move(HEADER_ROWS, 2)
+            sys.stdout.write(c("no wallpapers found. try fewer words or a lower resolution.", "33"))
+            self.draw_footer(size)
+            return
+
+        if self.previewer:
+            move(HEADER_ROWS, 2)
+            sys.stdout.write(c("loading thumbnails…", "2"))
+            sys.stdout.flush()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                thumbs = list(pool.map(self.thumb_path, items))
+            move(HEADER_ROWS, 0)
+            sys.stdout.write("\033[2K")
+            for i, (item, thumb) in enumerate(zip(items, thumbs)):
+                row = HEADER_ROWS + (i // cols) * CELL_H
+                col = (i % cols) * CELL_W + 1
+                if thumb:
+                    draw_image(self.previewer, thumb, row, col, THUMB_W, THUMB_H)
+                move(row + THUMB_H, col)
+                sys.stdout.write(self.label(self.offset + i, item, THUMB_W))
+        else:
+            for i, item in enumerate(items):
+                move(HEADER_ROWS + i, 2)
+                sys.stdout.write(self.label(self.offset + i, item, size.columns - 4)
+                                 + "  " + c(item["url"], "2"))
+        self.draw_footer(size)
+
+    def label(self, index, item, width):
+        num = c(f"{index + 1:>2}", "1;33")
+        mark = c(" ✓", "32") if item["id"] in self.downloaded else ""
+        info = f" {item['resolution']} {human_size(item.get('file_size', 0))}"
+        return num + c(info[: width - 4], "2") + mark
+
+    def draw_footer(self, size):
+        move(size.lines - FOOTER_ROWS, 0)
+        sys.stdout.write("\033[J")
+        if self.message:
+            sys.stdout.write(" " + self.message)
+        for i, line in enumerate(HELP):
+            move(size.lines - 3 + i, 0)
+            sys.stdout.write(c(" " + line[: size.columns - 2], "2"))
+        move(size.lines - 1, 0)
+        sys.stdout.flush()
+
+    # -- actions ------------------------------------------------------------
+
+    def new_search(self, query):
+        a = self.args
+        self.search = Search(query, a.res, a.exact, a.ratio, a.sort, a.categories)
+        self.offset = 0
+        self.status(f"searching '{query}'…")
+        try:
+            note = self.search.run()
+            self.message = c(note, "33") if note else ""
+        except SearchError as e:
+            self.message = c(str(e), "31")
+
+    def status(self, text):
+        size = shutil.get_terminal_size((80, 24))
+        move(size.lines - FOOTER_ROWS, 0)
+        sys.stdout.write("\033[2K " + c(text, "36"))
+        sys.stdout.flush()
+
+    def out_dir(self):
+        return (self.args.output or default_output_dir() / slugify(self.search.query)).expanduser()
+
+    def pick(self, numbers):
+        """Turn 1-based result numbers into items, ignoring out-of-range ones."""
+        loaded = self.search.ensure(max(numbers, default=0))
+        return [loaded[n - 1] for n in numbers if 1 <= n <= len(loaded)]
+
+    def download_items(self, items):
+        if not items:
+            self.message = c("no such wallpaper on this search", "33")
+            return []
+        self.status(f"downloading {len(items)} wallpaper{'s' * (len(items) > 1)}…")
+        out_dir = self.out_dir()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda it: download(it, out_dir, self.cache), items))
+        saved, failed = [], 0
+        for item, (dest, status) in zip(items, results):
+            if status in ("ok", "exists"):
+                self.downloaded[item["id"]] = dest
+                saved.append(dest)
+            else:
+                failed += 1
+        self.message = c(f"saved {len(saved)} to {out_dir}", "32")
+        if failed:
+            self.message += c(f" ({failed} failed)", "31")
+        return saved
+
+    def view(self, item):
+        """Show one wallpaper as big as the terminal allows."""
+        size = shutil.get_terminal_size((80, 24))
+        full = self.cache / item["path"].rsplit("/", 1)[-1]
+        if not full.exists():
+            self.status(f"loading {item['resolution']} image…")
+            try:
+                full.write_bytes(http_get(item["path"]))
+            except Exception as e:  # noqa: BLE001
+                self.message = c(f"couldn't load image: {e}", "31")
+                return
+        self.clear()
+        if self.previewer:
+            draw_image(self.previewer, full, 0, 0, size.columns, size.lines - 2)
+        move(size.lines - 2, 0)
+        sys.stdout.write(f" {c(item['resolution'], '1')}  {c(item['url'], '2')}")
+        move(size.lines - 1, 0)
+        sys.stdout.write(c(" enter: back · d: download · s: set as wallpaper > ", "2"))
+        sys.stdout.flush()
+        choice = input().strip().lower()
+        if choice == "d":
+            self.download_items([item])
+        elif choice == "s":
+            self.set_items([item])
+
+    def set_items(self, items):
+        saved = self.download_items(items)
+        if saved:
+            setter = set_wallpaper(saved[0])
+            self.message = (c(f"wallpaper set via {setter}", "1;35") if setter else
+                            c("couldn't find a wallpaper setter (caelestia, swww, hyprpaper, gsettings, plasma, swaybg, feh)", "33"))
+
+    def handle(self, line):
+        """Run one command. Returns False to quit."""
+        cmd, _, rest = line.partition(" ")
+        low = cmd.lower()
+        if not line:
+            return True
+        if line.lower() in ("q", "quit", "exit"):
+            return False
+
+        if self.search:
+            per_page = self.per_page()
+            numbers = parse_numbers(line)
+            if numbers:
+                self.download_items(self.pick(numbers))
+                return True
+            if low in ("d", "dl") and parse_numbers(rest):
+                self.download_items(self.pick(parse_numbers(rest)))
+                return True
+            if line.lower() in ("n", "next"):
+                self.search.ensure(self.offset + per_page + 1)
+                if self.offset + per_page < len(self.search.results):
+                    self.offset += per_page
+                else:
+                    self.message = c("that's the last page", "33")
+                return True
+            if line.lower() in ("p", "prev"):
+                self.offset = max(self.offset - per_page, 0)
+                return True
+            if line.lower() in ("a", "all"):
+                self.download_items(self.search.ensure(self.offset + per_page)[self.offset:])
+                return True
+            if low in ("v", "s", "o") and parse_numbers(rest):
+                items = self.pick(parse_numbers(rest)[:1])
+                if not items:
+                    self.message = c("no such wallpaper on this search", "33")
+                elif low == "v":
+                    self.view(items[0])
+                elif low == "s":
+                    self.set_items(items)
+                else:
+                    webbrowser.open(items[0]["url"])
+                return True
+            if low in ("r", "res") and rest:
+                res = RESOLUTIONS.get(rest.lower().lstrip("-"), rest.lower())
+                if res in ("any", "all", "none"):
+                    res = None
+                elif "x" not in res:
+                    self.message = c(f"unknown resolution '{rest}' (try 1080p, 1440p, 4k, 8k, 3440x1440, any)", "33")
+                    return True
+                self.args.res = res
+                self.new_search(self.search.query)
+                return True
+
+        self.new_search(line)
+        return True
+
+    def run(self, initial_query=None):
+        sys.stdout.write("\033[?1049h")  # alternate screen, like less/vim
+        try:
+            if initial_query:
+                self.new_search(initial_query)
+            while True:
+                self.render()
+                try:
+                    line = input(c(" search › " if not self.search else " › ", "1;36")).strip()
+                except EOFError:
+                    break
+                self.message = ""
+                if not self.handle(line):
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.clear()
+            sys.stdout.write("\033[?1049l")
+            sys.stdout.flush()
+            self._tmp.cleanup()
+        if self.downloaded:
+            print(c(f"paperoo: saved {len(self.downloaded)} wallpaper"
+                    f"{'s' * (len(self.downloaded) > 1)}", "1;32"))
+            for path in self.downloaded.values():
+                print("  " + str(path))
+
+
+def parse_numbers(text):
+    """'1 3 5-7' or '1,3,5-7' -> [1, 3, 5, 6, 7]; None if it isn't a number list."""
+    numbers = []
+    for part in text.replace(",", " ").split():
+        lo, sep, hi = part.partition("-")
+        if not lo.isdigit() or (sep and not hi.isdigit()):
+            return None
+        numbers.extend(range(int(lo), int(hi) + 1) if sep else [int(lo)])
+    return numbers or None
+
+
+# --------------------------------------------------------------------------- batch mode
+
+
+def batch(args):
+    """Non-interactive: download (or list) the top results directly."""
+    if not args.list:
+        print(c("searching", "1;36"), f"'{args.query}'", c(f"[{args.res or 'any res'}]", "2"))
+    search = Search(args.query, args.res, args.exact, args.ratio, args.sort, args.categories)
+    try:
+        note = search.run()
+        results = search.ensure(args.count)
+    except SearchError as e:
+        die(str(e))
+    if note:
+        print(c(note, "33"), file=sys.stderr)
+    if not results:
+        die(f"no wallpapers found for '{args.query}'. try fewer words or a lower resolution.")
+
+    if args.list:
+        for item in results:
+            print(item["path"])
+        return
+
+    out_dir = (args.output or default_output_dir() / slugify(search.query)).expanduser()
+    print(c(f"found {len(results)}, downloading to", "2"), out_dir)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(lambda it: download(it, out_dir), results))
+    ok = []
+    for item, (dest, status) in zip(results, outcomes):
+        good = status in ("ok", "exists")
+        if good:
+            ok.append(dest)
+        note = "" if status == "ok" else c(f" ({status})", "2")
+        print(f"  {c('✓', '32') if good else c('✗', '31')} {dest.name:<28} "
+              f"{item['resolution']:>10}  {human_size(item.get('file_size', 0)):>7}{note}")
+    print(c(f"done: {len(ok)}/{len(results)} saved", "1;32"))
+
+    if args.set:
+        if not ok:
+            die("nothing downloaded, can't set wallpaper")
+        setter = set_wallpaper(ok[0])
+        if setter:
+            print(c("wallpaper set", "1;35"), f"via {setter}: {ok[0].name}")
+        else:
+            print(c("couldn't detect a wallpaper setter (tried caelestia, swww, hyprpaper, gsettings, plasma, swaybg, feh)", "33"))
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="paperoo",
+        description="Browse and download wallpapers (via wallhaven.cc) from your terminal. "
+                    "Run without a query to open the browser and type a search.",
+        epilog="Set WALLHAVEN_API_KEY to use your wallhaven account settings.",
+    )
+    p.add_argument("query", nargs="*", help="what to search for, e.g. 'satoru gojo sunset'")
+
+    res = p.add_argument_group("resolution (minimum, unless --exact)")
+    res = res.add_mutually_exclusive_group()
+    res.add_argument("--hd", dest="res", action="store_const", const=RESOLUTIONS["hd"], help="1280x720+")
+    res.add_argument("--1080p", "--fhd", dest="res", action="store_const", const=RESOLUTIONS["1080p"], help="1920x1080+")
+    res.add_argument("--1440p", "--2k", "--qhd", dest="res", action="store_const", const=RESOLUTIONS["1440p"], help="2560x1440+")
+    res.add_argument("--4k", "--uhd", dest="res", action="store_const", const=RESOLUTIONS["4k"], help="3840x2160+")
+    res.add_argument("--5k", dest="res", action="store_const", const=RESOLUTIONS["5k"], help="5120x2880+")
+    res.add_argument("--8k", dest="res", action="store_const", const=RESOLUTIONS["8k"], help="7680x4320+")
+    res.add_argument("-r", "--res", dest="res", metavar="WxH", help="custom resolution, e.g. 3440x1440")
+    p.add_argument("--exact", action="store_true", help="only match the exact resolution")
+
+    shape = p.add_mutually_exclusive_group()
+    shape.add_argument("--phone", "--portrait", dest="ratio", action="store_const", const="portrait",
+                       help="portrait/phone wallpapers")
+    shape.add_argument("--ultrawide", dest="ratio", action="store_const", const="21x9", help="21:9 wallpapers")
+    shape.add_argument("--ratio", dest="ratio", metavar="RATIO", help="aspect ratio, e.g. 16x9, 16x10")
+
+    p.add_argument("-s", "--sort", choices=SORTS, default="relevance", help="sort order (default: relevance)")
+    p.add_argument("--anime", dest="categories", action="store_const", const="010", default="111",
+                   help="only anime wallpapers")
+    p.add_argument("--general", dest="categories", action="store_const", const="100",
+                   help="only general (non-anime) wallpapers")
+    p.add_argument("-o", "--output", type=Path, help="download folder (default: ~/Pictures/paperoo/<query>)")
+
+    batch_opts = p.add_argument_group("skip the browser")
+    batch_opts.add_argument("-y", "--yes", action="store_true",
+                            help="download the top results straight away")
+    batch_opts.add_argument("-n", "--count", type=int, default=5, help="how many to get with -y/--list (default: 5)")
+    batch_opts.add_argument("-l", "--list", action="store_true", help="only print the image links")
+    batch_opts.add_argument("--set", action="store_true", help="with -y: set the first result as your wallpaper")
+    p.add_argument("-V", "--version", action="version", version=f"paperoo {__version__}")
+
+    args = p.parse_args(argv)
+    args.query = " ".join(args.query).strip()
+    args.batch = args.yes or args.list or args.set
+    if args.batch and not args.query:
+        p.error("-y/--list/--set need a search query")
+    if args.count < 1:
+        p.error("--count must be at least 1")
+    if args.res and "x" not in args.res:
+        p.error(f"invalid resolution '{args.res}', expected WxH like 3840x2160")
+    if args.exact and not args.res:
+        p.error("--exact needs a resolution flag like --4k")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.batch:
+        batch(args)
+    elif not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if not args.query:
+            die("not running in a terminal; pass a query with -y or --list")
+        args.list = True  # piped: print links rather than downloading behind the user's back
+        batch(args)
+    else:
+        Browser(args).run(args.query or None)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
