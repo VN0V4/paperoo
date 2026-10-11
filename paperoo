@@ -15,6 +15,7 @@ Skip the browser and download straight away (good for scripts):
 
 import argparse
 import base64
+import codecs
 import concurrent.futures
 import json
 import os
@@ -325,28 +326,143 @@ def draw_image(previewer, path, row, col, width, height):
     sys.stdout.flush()
 
 
+# --------------------------------------------------------------------------- favorites & history
+
+HISTORY_LIMIT = 200
+RECORD_KEYS = ("id", "url", "path", "thumbs", "resolution", "file_size")
+
+
+class Store:
+    """Favorites and wallpaper history, kept in ~/.local/share/paperoo."""
+
+    def __init__(self):
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+        self.dir = base / "paperoo"
+        self.lists = {name: self._load(name) for name in ("favorites", "history")}
+
+    def _load(self, name):
+        try:
+            data = json.loads((self.dir / f"{name}.json").read_text())
+            return [r for r in data if isinstance(r, dict) and "id" in r and "path" in r]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _save(self, name):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.dir / f"{name}.json.tmp"
+        tmp.write_text(json.dumps(self.lists[name], indent=1))
+        tmp.replace(self.dir / f"{name}.json")
+
+    @staticmethod
+    def record(item, local=None, query=None):
+        rec = {k: item[k] for k in RECORD_KEYS if k in item}
+        rec["local"] = str(local) if local else item.get("local")
+        rec["query"] = query or item.get("query")
+        rec["added"] = int(time.time())
+        return rec
+
+    def is_favorite(self, item_id):
+        return any(r["id"] == item_id for r in self.lists["favorites"])
+
+    def toggle_favorite(self, item, local=None, query=None):
+        """Star or unstar a wallpaper. Returns True if it is now a favorite."""
+        if self.is_favorite(item["id"]):
+            self.remove("favorites", item["id"])
+            return False
+        self.lists["favorites"].insert(0, self.record(item, local, query))
+        self._save("favorites")
+        return True
+
+    def add_history(self, item, local, query=None):
+        """Put a wallpaper that was just set at the top of the history."""
+        hist = self.lists["history"]
+        hist[:] = [r for r in hist if r["id"] != item["id"]]
+        hist.insert(0, self.record(item, local, query))
+        del hist[HISTORY_LIMIT:]
+        self._save("history")
+
+    def remove(self, name, item_id):
+        self.lists[name][:] = [r for r in self.lists[name] if r["id"] != item_id]
+        self._save(name)
+
+    def note_download(self, item_id, local):
+        """Remember where a saved wallpaper was downloaded to."""
+        for name, records in self.lists.items():
+            for r in records:
+                if r["id"] == item_id and r.get("local") != str(local):
+                    r["local"] = str(local)
+                    self._save(name)
+
+    def local_file(self, item_id):
+        """The downloaded file for a saved wallpaper, if it still exists."""
+        for records in self.lists.values():
+            for r in records:
+                if r["id"] == item_id and r.get("local") and Path(r["local"]).is_file():
+                    return Path(r["local"])
+        return None
+
+
+class SavedList:
+    """A favorites/history list, shaped like Search so the browser can show either."""
+
+    exhausted = True
+
+    def __init__(self, name, records):
+        self.query, self.results = name, records
+
+    @property
+    def total(self):
+        return len(self.results)
+
+    def ensure(self, n):
+        return self.results[:n]
+
+
 # --------------------------------------------------------------------------- interactive browser
 
 CELL_W, CELL_H = 30, 11  # one grid cell: thumbnail + label + gap
 THUMB_W, THUMB_H = 28, 9
-HEADER_ROWS, FOOTER_ROWS = 2, 4
+HEADER_ROWS, FOOTER_ROWS = 3, 4
+TABS = ("search", "favorites", "history")
 
-HELP = ["type to search · 1 3 5-8 download · a download page · v N view big · s N set wallpaper",
-        "n/p next/prev page · o N open in browser · r 4k change resolution · q quit"]
+HELP = ["type to search · 1 3 5-8 download · a download page · v N view big · s N set wallpaper · f N ★",
+        "tab/shift-tab switch tabs (or f/h/b) · n/p page · x N remove · o N open · r 4k res · q quit"]
+
+EMPTY = {
+    "favorites": "no favorites yet. type f N on any wallpaper to star it.",
+    "history": "no history yet. wallpapers you set with s N show up here.",
+}
 
 
 class Browser:
     def __init__(self, args):
         self.args = args
         self.previewer = detect_previewer()
+        self.store = Store()
         self.search = None
-        self.offset = 0
+        self.tab = "search"
+        self.offsets = dict.fromkeys(TABS, 0)
         self.message = ""
-        self.downloaded = {}  # id -> path
+        self.downloaded = {}  # id -> path, for this session
         self._tmp = tempfile.TemporaryDirectory(prefix="paperoo-")
         self.cache = Path(self._tmp.name)
         if not self.previewer:
             self.message = c("tip: install chafa (or use kitty/WezTerm/iTerm2) to see thumbnails", "33")
+
+    @property
+    def source(self):
+        """What the current tab is showing: a Search, a SavedList, or None."""
+        if self.tab == "search":
+            return self.search
+        return SavedList(self.tab, self.store.lists[self.tab])
+
+    @property
+    def offset(self):
+        return self.offsets[self.tab]
+
+    @offset.setter
+    def offset(self, value):
+        self.offsets[self.tab] = value
 
     # -- layout -------------------------------------------------------------
 
@@ -379,24 +495,39 @@ class Browser:
                 return None
         return path
 
+    def draw_tabs(self):
+        tabs = []
+        for name in TABS:
+            text = name if name == "search" else f"{name} {len(self.store.lists[name])}"
+            tabs.append(c(f" {text} ", "1;7" if name == self.tab else "2"))
+        sys.stdout.write(c(" paperoo ", "1;30;46") + "  " + " ".join(tabs))
+
     def render(self):
         size, cols, rows = self.layout()
+        per_page = cols * rows
         self.clear()
-        title = c(" paperoo ", "1;30;46")
-        if not self.search:
-            sys.stdout.write(f"{title}  {c('search wallpapers by typing below', '2')}")
+        self.draw_tabs()
+        src = self.source
+        move(1, 0)
+        if src is None:
+            sys.stdout.write(c(" search wallpapers by typing below", "2"))
             self.draw_footer(size)
             return
-        s = self.search
-        items = s.ensure(self.offset + cols * rows)[self.offset:]
-        page = self.offset // (cols * rows) + 1
-        pages = max(-(-s.total // (cols * rows)), 1)
-        sys.stdout.write(f"{title}  {c(repr(s.query), '1')}  {c(s.describe(), '36')}  "
-                         f"{c(f'{s.total} results · page {page}/{pages}', '2')}")
+
+        if self.offset >= src.total and self.offset:  # list shrank (x N)
+            self.offset = max((src.total - 1) // per_page * per_page, 0)
+        items = src.ensure(self.offset + per_page)[self.offset:]
+        page = self.offset // per_page + 1
+        pages = max(-(-src.total // per_page), 1)
+        if isinstance(src, Search):
+            sys.stdout.write(f" {c(repr(src.query), '1')}  {c(src.describe(), '36')}  "
+                             f"{c(f'{src.total} results · page {page}/{pages}', '2')}")
+        else:
+            sys.stdout.write(c(f" {src.total} saved · page {page}/{pages}", "2"))
 
         if not items:
             move(HEADER_ROWS, 2)
-            sys.stdout.write(c("no wallpapers found. try fewer words or a lower resolution.", "33"))
+            sys.stdout.write(c(EMPTY.get(self.tab, "no wallpapers found. try fewer words or a lower resolution."), "33"))
             self.draw_footer(size)
             return
 
@@ -424,9 +555,10 @@ class Browser:
 
     def label(self, index, item, width):
         num = c(f"{index + 1:>2}", "1;33")
-        mark = c(" ✓", "32") if item["id"] in self.downloaded else ""
+        star = c(" ★", "1;33") if self.store.is_favorite(item["id"]) else ""
+        mark = c(" ✓", "32") if self.local_file(item) else ""
         info = f" {item['resolution']} {human_size(item.get('file_size', 0))}"
-        return num + c(info[: width - 4], "2") + mark
+        return num + c(info[: width - 6], "2") + star + mark
 
     def draw_footer(self, size):
         move(size.lines - FOOTER_ROWS, 0)
@@ -443,6 +575,7 @@ class Browser:
 
     def new_search(self, query):
         a = self.args
+        self.tab = "search"
         self.search = Search(query, a.res, a.exact, a.ratio, a.sort, a.categories)
         self.offset = 0
         self.status(f"searching '{query}'…")
@@ -458,30 +591,51 @@ class Browser:
         sys.stdout.write("\033[2K " + c(text, "36"))
         sys.stdout.flush()
 
-    def out_dir(self):
-        return (self.args.output or default_output_dir() / slugify(self.search.query)).expanduser()
+    def query_for(self, item):
+        """The search a wallpaper came from (used for its download folder)."""
+        if item.get("query"):
+            return item["query"]
+        if self.tab == "search" and self.search:
+            return self.search.query
+        return self.tab
+
+    def dir_for(self, item):
+        return (self.args.output or default_output_dir() / slugify(self.query_for(item))).expanduser()
+
+    def local_file(self, item):
+        path = self.downloaded.get(item["id"])
+        if path and path.is_file():
+            return path
+        return self.store.local_file(item["id"])
 
     def pick(self, numbers):
-        """Turn 1-based result numbers into items, ignoring out-of-range ones."""
-        loaded = self.search.ensure(max(numbers, default=0))
+        """Turn 1-based numbers on the current tab into items, ignoring out-of-range ones."""
+        loaded = self.source.ensure(max(numbers, default=0))
         return [loaded[n - 1] for n in numbers if 1 <= n <= len(loaded)]
+
+    def fetch(self, item):
+        local = self.local_file(item)
+        if local:
+            return local, "exists"
+        return download(item, self.dir_for(item), self.cache)
 
     def download_items(self, items):
         if not items:
-            self.message = c("no such wallpaper on this search", "33")
+            self.message = c("no wallpaper with that number here", "33")
             return []
         self.status(f"downloading {len(items)} wallpaper{'s' * (len(items) > 1)}…")
-        out_dir = self.out_dir()
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(lambda it: download(it, out_dir, self.cache), items))
+            results = list(pool.map(self.fetch, items))
         saved, failed = [], 0
         for item, (dest, status) in zip(items, results):
             if status in ("ok", "exists"):
                 self.downloaded[item["id"]] = dest
+                self.store.note_download(item["id"], dest)
                 saved.append(dest)
             else:
                 failed += 1
-        self.message = c(f"saved {len(saved)} to {out_dir}", "32")
+        where = f" to {saved[0].parent}" if saved and all(p.parent == saved[0].parent for p in saved) else ""
+        self.message = c(f"saved {len(saved)}{where}", "32")
         if failed:
             self.message += c(f" ({failed} failed)", "31")
         return saved
@@ -489,7 +643,7 @@ class Browser:
     def view(self, item):
         """Show one wallpaper as big as the terminal allows."""
         size = shutil.get_terminal_size((80, 24))
-        full = self.cache / item["path"].rsplit("/", 1)[-1]
+        full = self.local_file(item) or self.cache / item["path"].rsplit("/", 1)[-1]
         if not full.exists():
             self.status(f"loading {item['resolution']} image…")
             try:
@@ -501,58 +655,106 @@ class Browser:
         if self.previewer:
             draw_image(self.previewer, full, 0, 0, size.columns, size.lines - 2)
         move(size.lines - 2, 0)
-        sys.stdout.write(f" {c(item['resolution'], '1')}  {c(item['url'], '2')}")
+        star = c(" ★", "1;33") if self.store.is_favorite(item["id"]) else ""
+        sys.stdout.write(f" {c(item['resolution'], '1')}{star}  {c(item['url'], '2')}")
         move(size.lines - 1, 0)
-        sys.stdout.write(c(" enter: back · d: download · s: set as wallpaper > ", "2"))
+        sys.stdout.write(c(" enter: back · d: download · s: set as wallpaper · f: favorite > ", "2"))
         sys.stdout.flush()
         choice = input().strip().lower()
         if choice == "d":
             self.download_items([item])
         elif choice == "s":
             self.set_items([item])
+        elif choice == "f":
+            self.favorite_items([item])
 
     def set_items(self, items):
-        saved = self.download_items(items)
-        if saved:
-            setter = set_wallpaper(saved[0])
-            self.message = (c(f"wallpaper set via {setter}", "1;35") if setter else
-                            c("couldn't find a wallpaper setter (caelestia, swww, hyprpaper, gsettings, plasma, swaybg, feh)", "33"))
+        saved = self.download_items(items[:1])
+        if not saved:
+            return
+        setter = set_wallpaper(saved[0])
+        if setter:
+            self.store.add_history(items[0], saved[0], self.query_for(items[0]))
+            self.message = c(f"wallpaper set via {setter}", "1;35")
+        else:
+            self.message = c("couldn't find a wallpaper setter "
+                             "(caelestia, swww, hyprpaper, gsettings, plasma, swaybg, feh)", "33")
+
+    def favorite_items(self, items):
+        if not items:
+            self.message = c("no wallpaper with that number here", "33")
+            return
+        added = removed = 0
+        for item in items:
+            if self.store.toggle_favorite(item, self.local_file(item), self.query_for(item)):
+                added += 1
+            else:
+                removed += 1
+        parts = [f"★ added {added} to favorites"] * bool(added) + [f"removed {removed} from favorites"] * bool(removed)
+        self.message = c(" · ".join(parts), "1;33")
+
+    def remove_items(self, items):
+        if self.tab == "search":
+            self.message = c("x removes from favorites/history; use f N to unstar", "33")
+            return
+        for item in items:
+            self.store.remove(self.tab, item["id"])
+        self.message = c(f"removed {len(items)} from {self.tab}", "33")
 
     def handle(self, line):
         """Run one command. Returns False to quit."""
         cmd, _, rest = line.partition(" ")
-        low = cmd.lower()
+        low, word = cmd.lower(), line.lower()
         if not line:
             return True
-        if line.lower() in ("q", "quit", "exit"):
+        if word in ("q", "quit", "exit"):
             return False
+        if word in ("f", "fav", "favs", "favorites", "favourites"):
+            self.tab = "favorites"
+            return True
+        if word in ("h", "hist", "history"):
+            self.tab = "history"
+            return True
+        if word in ("b", "back", "search"):
+            self.tab = "search"
+            if not self.search:
+                self.message = c("type something to search", "2")
+            return True
 
-        if self.search:
+        src = self.source
+        if src is not None:
             per_page = self.per_page()
             numbers = parse_numbers(line)
             if numbers:
                 self.download_items(self.pick(numbers))
                 return True
-            if low in ("d", "dl") and parse_numbers(rest):
-                self.download_items(self.pick(parse_numbers(rest)))
-                return True
-            if line.lower() in ("n", "next"):
-                self.search.ensure(self.offset + per_page + 1)
-                if self.offset + per_page < len(self.search.results):
+            if word in ("n", "next"):
+                src.ensure(self.offset + per_page + 1)
+                if self.offset + per_page < len(src.results):
                     self.offset += per_page
                 else:
                     self.message = c("that's the last page", "33")
                 return True
-            if line.lower() in ("p", "prev"):
+            if word in ("p", "prev"):
                 self.offset = max(self.offset - per_page, 0)
                 return True
-            if line.lower() in ("a", "all"):
-                self.download_items(self.search.ensure(self.offset + per_page)[self.offset:])
+            if word in ("a", "all"):
+                self.download_items(src.ensure(self.offset + per_page)[self.offset:])
                 return True
-            if low in ("v", "s", "o") and parse_numbers(rest):
-                items = self.pick(parse_numbers(rest)[:1])
+            numbers = parse_numbers(rest)
+            if low in ("d", "dl", "f", "fav", "x", "rm") and numbers:
+                items = self.pick(numbers)
+                if low in ("d", "dl"):
+                    self.download_items(items)
+                elif low in ("f", "fav"):
+                    self.favorite_items(items)
+                else:
+                    self.remove_items(items)
+                return True
+            if low in ("v", "s", "o") and numbers:
+                items = self.pick(numbers[:1])
                 if not items:
-                    self.message = c("no such wallpaper on this search", "33")
+                    self.message = c("no wallpaper with that number here", "33")
                 elif low == "v":
                     self.view(items[0])
                 elif low == "s":
@@ -560,33 +762,43 @@ class Browser:
                 else:
                     webbrowser.open(items[0]["url"])
                 return True
-            if low in ("r", "res") and rest:
-                res = RESOLUTIONS.get(rest.lower().lstrip("-"), rest.lower())
-                if res in ("any", "all", "none"):
-                    res = None
-                elif "x" not in res:
-                    self.message = c(f"unknown resolution '{rest}' (try 1080p, 1440p, 4k, 8k, 3440x1440, any)", "33")
-                    return True
-                self.args.res = res
-                self.new_search(self.search.query)
+        if low in ("r", "res") and rest and self.search:
+            res = RESOLUTIONS.get(rest.lower().lstrip("-"), rest.lower())
+            if res in ("any", "all", "none"):
+                res = None
+            elif "x" not in res:
+                self.message = c(f"unknown resolution '{rest}' (try 1080p, 1440p, 4k, 8k, 3440x1440, any)", "33")
                 return True
+            self.args.res = res
+            self.new_search(self.search.query)
+            return True
 
         self.new_search(line)
         return True
 
-    def run(self, initial_query=None):
+    def run(self, initial_query=None, initial_tab=None):
         sys.stdout.write("\033[?1049h")  # alternate screen, like less/vim
         try:
             if initial_query:
                 self.new_search(initial_query)
+            if initial_tab:
+                self.tab = initial_tab
+            draft = ""  # text typed before Tab was pressed, kept across tab switches
             while True:
                 self.render()
                 try:
-                    line = input(c(" search › " if not self.search else " › ", "1;36")).strip()
+                    prompt = " search › " if self.source is None else " › "
+                    line, key = read_line(c(prompt, "1;36"), draft)
                 except EOFError:
                     break
+                if key in ("tab", "backtab"):
+                    step = 1 if key == "tab" else -1
+                    self.tab = TABS[(TABS.index(self.tab) + step) % len(TABS)]
+                    draft = line
+                    continue
+                draft = ""
                 self.message = ""
-                if not self.handle(line):
+                if not self.handle(line.strip()):
                     break
         except KeyboardInterrupt:
             pass
@@ -600,6 +812,71 @@ class Browser:
                     f"{'s' * (len(self.downloaded) > 1)}", "1;32"))
             for path in self.downloaded.values():
                 print("  " + str(path))
+
+
+def read_line(prompt, initial=""):
+    """Read a line of input, also catching Tab and Shift-Tab.
+
+    Returns (text, key) where key is "enter", "tab" or "backtab".
+    Falls back to plain input() where the terminal can't be put in cbreak mode.
+    """
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except (ImportError, OSError, ValueError):
+        return input(prompt + initial), "enter"
+
+    def ready():  # is another byte already waiting? (tells Esc apart from Esc sequences)
+        import select
+        return bool(select.select([fd], [], [], 0.05)[0])
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+    buf = initial
+    sys.stdout.write(prompt + buf)
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)  # no echo, no line buffering; Ctrl-C still interrupts
+        while True:
+            ch = decoder.decode(os.read(fd, 1))
+            if not ch:
+                continue
+            if ch in ("\r", "\n"):
+                key = "enter"
+                break
+            if ch == "\t":
+                key = "tab"
+                break
+            if ch == "\x1b":
+                seq = ""
+                while ready():
+                    seq += os.read(fd, 1).decode("latin-1")
+                    if len(seq) > 1 and "@" <= seq[-1] <= "~":
+                        break
+                if seq == "[Z":
+                    key = "backtab"
+                    break
+                continue  # ignore arrows and other escape sequences
+            if ch == "\x04" and not buf:  # Ctrl-D
+                raise EOFError
+            if ch in ("\x7f", "\x08"):  # backspace
+                if buf:
+                    buf = buf[:-1]
+                    sys.stdout.write("\b \b")
+            elif ch in ("\x15", "\x17"):  # Ctrl-U clears the line, Ctrl-W one word
+                stripped = buf.rstrip()
+                keep = "" if ch == "\x15" else stripped[: stripped.rfind(" ") + 1]
+                sys.stdout.write("\b \b" * (len(buf) - len(keep)))
+                buf = keep
+            elif ch >= " ":
+                buf += ch
+                sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    sys.stdout.write("\n")
+    return buf, key
 
 
 def parse_numbers(text):
@@ -644,7 +921,7 @@ def batch(args):
     for item, (dest, status) in zip(results, outcomes):
         good = status in ("ok", "exists")
         if good:
-            ok.append(dest)
+            ok.append((item, dest))
         note = "" if status == "ok" else c(f" ({status})", "2")
         print(f"  {c('✓', '32') if good else c('✗', '31')} {dest.name:<28} "
               f"{item['resolution']:>10}  {human_size(item.get('file_size', 0)):>7}{note}")
@@ -653,9 +930,11 @@ def batch(args):
     if args.set:
         if not ok:
             die("nothing downloaded, can't set wallpaper")
-        setter = set_wallpaper(ok[0])
+        item, dest = ok[0]
+        setter = set_wallpaper(dest)
         if setter:
-            print(c("wallpaper set", "1;35"), f"via {setter}: {ok[0].name}")
+            Store().add_history(item, dest, search.query)
+            print(c("wallpaper set", "1;35"), f"via {setter}: {dest.name}")
         else:
             print(c("couldn't detect a wallpaper setter (tried caelestia, swww, hyprpaper, gsettings, plasma, swaybg, feh)", "33"))
 
@@ -696,6 +975,12 @@ def parse_args(argv):
                    help="only general (non-anime) wallpapers")
     p.add_argument("-o", "--output", type=Path, help="download folder (default: ~/Pictures/paperoo/<query>)")
 
+    tabs = p.add_mutually_exclusive_group()
+    tabs.add_argument("-f", "--favorites", dest="tab", action="store_const", const="favorites",
+                      help="open on your favorites")
+    tabs.add_argument("-H", "--history", dest="tab", action="store_const", const="history",
+                      help="open on wallpapers you've set before")
+
     batch_opts = p.add_argument_group("skip the browser")
     batch_opts.add_argument("-y", "--yes", action="store_true",
                             help="download the top results straight away")
@@ -720,6 +1005,10 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.tab and not args.query and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        for rec in Store().lists[args.tab]:  # piped: print the saved list
+            print(rec.get("local") if rec.get("local") and Path(rec["local"]).is_file() else rec["path"])
+        return
     if args.batch:
         batch(args)
     elif not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -728,7 +1017,7 @@ def main(argv=None):
         args.list = True  # piped: print links rather than downloading behind the user's back
         batch(args)
     else:
-        Browser(args).run(args.query or None)
+        Browser(args).run(args.query or None, args.tab)
 
 
 if __name__ == "__main__":

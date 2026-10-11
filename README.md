@@ -63,11 +63,19 @@ In the browser, type at the `›` prompt:
 | `v 3` | view #3 as big as the terminal allows (`d` to download, `s` to set) |
 | `s 3` | download #3 and set it as your wallpaper |
 | `o 3` | open #3 on wallhaven in your browser |
+| `f 3` or `f 1-4` | star / unstar wallpapers as favorites (★) |
+| `Tab` / `Shift-Tab` | cycle through the search, favorites and history tabs (`f` / `h` / `b` jump straight to one) |
+| `x 3` | remove #3 from the favorites or history list you're looking at |
 | `n` / `p` | next / previous page |
 | `r 4k`, `r 1440p`, `r 3440x1440`, `r any` | change the minimum resolution |
 | `q` | quit (Ctrl-C works too) |
 
 If a search finds nothing, paperoo drops words from the end until it finds something.
+
+### Favorites & history
+
+Every wallpaper you set with paperoo goes into **history**, newest first. To switch back to an earlier one, open the history tab (`h`, or `paperoo --history`) and type `s N`. Star anything with `f N` to keep it in **favorites** (`f`, or `paperoo --favorites`).
+Both lists are stored in `~/.local/share/paperoo/`. If you've already downloaded a wallpaper, paperoo reuses that file instead of downloading it again.
 
 ## Flags
 
@@ -80,6 +88,7 @@ If a search finds nothing, paperoo drops words from the end until it finds somet
 | `-s, --sort` | `relevance` (default), `random`, `toplist`, `views`, `favorites`, `date_added` |
 | `--anime` / `--general` | limit the category |
 | `-o, --output DIR` | where to save |
+| `-f, --favorites` / `-H, --history` | open on that tab (when piped, prints the list) |
 
 ### Without the browser (scripts)
 
