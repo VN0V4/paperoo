@@ -2,19 +2,10 @@
 
 Browse and download wallpapers from your terminal. Search, look through a grid of thumbnails, then pick the ones you want by number.
 
-```
-paperoo   'sunset'  3840x2160+  4 results · page 1/1
-
- ┌────────────────────────┐   ┌────────────────────────┐   ┌────────────────────────┐
- │       thumbnail        │   │       thumbnail        │   │       thumbnail        │
- └────────────────────────┘   └────────────────────────┘   └────────────────────────┘
-  1 3840x2160 1.3MB ✓          2 3840x2160 1.8MB            3 5160x2160 8.3MB ✓
-
- saved 2 to ~/Pictures/paperoo/sunset
- type to search · 1 3 5-8 download · a download page · v N view big · s N set wallpaper
- n/p next/prev page · o N open in browser · r 4k change resolution · q quit
- ›
-```
+<img src=".github/screenshot.png" width="800" height="400">
+<a href="https://ko-fi.com/n0va">
+  <img src=".github/support_me_on_kofi.png" alt="" width="250" height="100">
+</a>
 
 Wallpapers come from [wallhaven.cc](https://wallhaven.cc) and are saved to `~/Pictures/paperoo/<search>/`.
 
@@ -33,7 +24,7 @@ Only needs Python 3. No pip packages are needed.
 ./install.sh            # copies paperoo into ~/.local/bin
 ```
 
-On Nix: `nix run github:<you>/paperoo`, or add the flake's package to your config. The Nix package includes chafa.
+On Nix: `nix run github:VN0V4/paperoo`, or add the flake's package to your config. The Nix package includes chafa.
 
 ### Thumbnails
 
